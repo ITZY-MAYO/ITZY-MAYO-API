@@ -2,6 +2,7 @@ from fastapi import APIRouter, status
 from src.models.location import LocationCreate
 import logging
 import asyncio
+from datetime import datetime, timedelta, timezone # Import datetime utilities
 
 # Firebase Admin SDK
 import firebase_admin
@@ -19,6 +20,8 @@ from geopy.distance import geodesic
 from src.services.notification_service import send_fcm_proximity_notification
 
 from src.crud import crud_schedule # Import the crud_schedule module
+from src.crud import crud_fcm_token # Import the new FCM token CRUD module
+from src.crud import crud_notification_history # Import notification history CRUD
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -47,6 +50,7 @@ async def handle_location_update_and_proximity_check(location_data: LocationCrea
     db = firestore.AsyncClient()
     found_proximate_schedule = False
     notification_sent_status = False
+    proximate_schedule_item = None # Store the found schedule item
     details = "No proximate schedule found or user has no token."
 
     # Placeholder for original functionality: Store the location_data if needed
@@ -61,63 +65,89 @@ async def handle_location_update_and_proximity_check(location_data: LocationCrea
 
         current_device_location = (location_data.latitude, location_data.longitude)
 
-        for schedule_item in user_schedules: # Iterate over Schedule model instances
-            # schedule_item is now a Schedule Pydantic model instance
+        for schedule_item_loop in user_schedules: # Iterate over Schedule model instances
+            # schedule_item_loop is now a Schedule Pydantic model instance
             # which has latitude and longitude attributes directly
             
-            # Ensure schedule_item has latitude and longitude
-            if schedule_item.latitude is not None and schedule_item.longitude is not None:
+            # Ensure schedule_item_loop has latitude and longitude
+            if schedule_item_loop.latitude is not None and schedule_item_loop.longitude is not None:
                 schedule_location = (
-                    schedule_item.latitude,
-                    schedule_item.longitude,
+                    schedule_item_loop.latitude,
+                    schedule_item_loop.longitude,
                 )
                 distance_meters = geodesic(
                     current_device_location, schedule_location
                 ).meters
-                logger.info(f"Comparing with schedule '{schedule_item.name}' (ID: {schedule_item.id}) at ({schedule_item.latitude}, {schedule_item.longitude}). Distance: {distance_meters:.2f}m")
+                logger.info(f"Comparing with schedule '{schedule_item_loop.name}' (ID: {schedule_item_loop.id}). Distance: {distance_meters:.2f}m")
 
                 if distance_meters <= 100: # Using 100 meters as proximity threshold
                     found_proximate_schedule = True
+                    proximate_schedule_item = schedule_item_loop # Save the matched schedule
                     logger.info(
-                        f"User {location_data.firebase_userid} is within 100m of schedule '{schedule_item.name}' (ID: {schedule_item.id}) (distance: {distance_meters:.2f}m)"
+                        f"User {location_data.firebase_userid} is within 100m of schedule '{proximate_schedule_item.name}' (ID: {proximate_schedule_item.id})."
                     )
                     break  # Found one, no need to check further
             else:
                 logger.warning(
-                    f"Schedule {schedule_item.id} for user {location_data.firebase_userid} has missing latitude or longitude."
+                    f"Schedule {schedule_item_loop.id} for user {location_data.firebase_userid} has missing latitude or longitude."
                 )
 
-        if found_proximate_schedule:
-            fcm_token_doc_ref = db.collection("fcm_token").document(
-                location_data.firebase_userid
+        if found_proximate_schedule and proximate_schedule_item:
+            current_time = datetime.now(timezone.utc)
+            can_send_notification = True
+
+            # Check notification history for cooldown
+            history = await crud_notification_history.get_notification_history(
+                db, location_data.firebase_userid, proximate_schedule_item.id
             )
-            fcm_token_doc = await fcm_token_doc_ref.get()  # Add await here
 
-            if fcm_token_doc.exists:
-                fcm_token_data = fcm_token_doc.to_dict()
-                user_fcm_token = fcm_token_data.get("token") if fcm_token_data else None
+            if history and history.last_sent_at:
+                # Ensure last_sent_at is offset-aware for comparison with current_time
+                last_sent_at_aware = history.last_sent_at
+                if last_sent_at_aware.tzinfo is None:
+                    last_sent_at_aware = last_sent_at_aware.replace(tzinfo=timezone.utc)
+                
+                time_since_last_sent = current_time - last_sent_at_aware
+                if time_since_last_sent < timedelta(minutes=10):
+                    can_send_notification = False
+                    cooldown_remaining = timedelta(minutes=10) - time_since_last_sent
+                    details = f"Notification for schedule '{proximate_schedule_item.name}' recently sent. Cooldown active for {cooldown_remaining.total_seconds() // 60:.0f} more minutes."
+                    logger.info(details)
+                else:
+                    logger.info(f"Cooldown period for schedule '{proximate_schedule_item.name}' has passed. Last sent: {history.last_sent_at}")
+            else:
+                logger.info(f"No previous notification history found for schedule '{proximate_schedule_item.name}'.")
 
-                if user_fcm_token:
+            if can_send_notification:
+                # Fetch FCM token using the CRUD function
+                fcm_token_obj = await crud_fcm_token.get_fcm_token_by_user_id(
+                    db=db, firebase_userid=location_data.firebase_userid
+                )
+
+                if fcm_token_obj and fcm_token_obj.token:
+                    user_fcm_token = fcm_token_obj.token
                     logger.info(
-                        f"Found FCM token for user {location_data.firebase_userid}."
+                        f"Attempting to send FCM to user {location_data.firebase_userid} for schedule '{proximate_schedule_item.name}'."
                     )
                     if await send_fcm_proximity_notification(
                         user_fcm_token, location_data.firebase_userid
                     ):
                         notification_sent_status = True
-                        details = "Notification sent successfully."
+                        details = f"Notification sent successfully for schedule '{proximate_schedule_item.name}'."
+                        logger.info(details)
+                        # Update notification history
+                        await crud_notification_history.update_notification_history(
+                            db, location_data.firebase_userid, proximate_schedule_item.id, current_time
+                        )
                     else:
-                        details = "Proximate schedule found, FCM token found, but failed to send notification."
+                        details = f"FCM token found, but failed to send notification for schedule '{proximate_schedule_item.name}'."
+                        logger.error(details) # Log as error if sending failed
+                elif fcm_token_obj:
+                    details = f"FCM token document found, but token string is missing for user {location_data.firebase_userid}. Cannot send notification for '{proximate_schedule_item.name}'."
+                    logger.warning(details)
                 else:
-                    details = "Proximate schedule found, but user's FCM token is missing in the document."
-                    logger.warning(
-                        f"FCM token missing in document for user {location_data.firebase_userid}."
-                    )
-            else:
-                details = "Proximate schedule found, but no FCM token document found for user."
-                logger.warning(
-                    f"No FCM token document found for user {location_data.firebase_userid}."
-                )
+                    details = f"No FCM token document found for user {location_data.firebase_userid}. Cannot send notification for '{proximate_schedule_item.name}'."
+                    logger.warning(details)
         else:
             details = "No proximate schedule found for the user."
             logger.info(
