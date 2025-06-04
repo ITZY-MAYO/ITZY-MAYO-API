@@ -47,11 +47,11 @@ async def handle_location_update_and_proximity_check(location_data: LocationCrea
     details = "No proximate schedule found or user has no token."
 
     # Placeholder for original functionality: Store the location_data if needed
-    # logger.info(f"Received location for user {location_data.firebase_userid}: lat={location_data.latitude}, lon={location_data.longitude}")
+    logger.info(f"Received location for user {location_data.firebase_userid}: lat={location_data.latitude}, lon={location_data.longitude}")
     # e.g., await crud.store_location(db, location_data)
 
     try:
-        schedules_ref = db.collection("schedules")
+        schedules_ref = db.collection("schedule")
         # Use await for stream() and iterate with async for
         user_schedules_stream = schedules_ref.where(
             "firebase_userid", "==", location_data.firebase_userid
@@ -64,7 +64,7 @@ async def handle_location_update_and_proximity_check(location_data: LocationCrea
             if not schedule_data:
                 continue
 
-            location_geopoint = schedule_data.get("location_geopoint")
+            location_geopoint = schedule_data.get("geoPoint")
             if isinstance(location_geopoint, firestore.GeoPoint):
                 schedule_location = (
                     location_geopoint.latitude,
