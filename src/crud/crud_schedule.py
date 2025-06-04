@@ -1,14 +1,18 @@
 from firebase_admin import firestore
-from google.cloud.firestore_v1 import GeoPoint  # For creating GeoPoint instances
+from google.cloud.firestore_v1 import GeoPoint, FieldFilter  # For creating GeoPoint instances and FieldFilter
 from typing import (
     List,
     Optional,
 )  # For older Python, use List & Optional. For 3.9+, use list & | None
+from datetime import datetime # Ensure datetime is imported
 
 from src.models.schedule import Schedule, ScheduleCreate, ScheduleUpdate
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Firestore collection name
-SCHEDULES_COLLECTION = "schedules"
+SCHEDULES_COLLECTION = "schedule"
 
 
 async def create_schedule(
@@ -20,21 +24,35 @@ async def create_schedule(
     """
     doc_ref = db.collection(SCHEDULES_COLLECTION).document()  # Auto-generate ID
 
-    schedule_dict = schedule_data.model_dump()
-    # Convert lat/lon to GeoPoint before saving
-    schedule_dict["location_geopoint"] = GeoPoint(
-        schedule_data.latitude, schedule_data.longitude
-    )
-    # Remove individual latitude and longitude as they are now in location_geopoint
-    del schedule_dict["latitude"]
-    del schedule_dict["longitude"]
+    # Manually construct the dictionary for Firestore using Pydantic model attribute names
+    # Pydantic's aliases are for how data is *loaded* into the model or *dumped with by_alias=True*.
+    # Here, we are constructing the Firestore document from the Pydantic model attributes.
+    firestore_data = {
+        "title": schedule_data.name, # Pydantic's .name maps to Firestore's "title"
+        "userId": schedule_data.firebase_userid, # Pydantic's .firebase_userid maps to "userId"
+        "content": schedule_data.description, # Pydantic's .description maps to "content"
+        "geoPoint": GeoPoint(schedule_data.latitude, schedule_data.longitude), # Store as geoPoint
+        "datetime": schedule_data.schedule_datetime # Pydantic's .schedule_datetime to "datetime"
+    }
+    # Note: The model_dump(by_alias=True) approach could also work if structured carefully.
+    # e.g., temp_dict = schedule_data.model_dump(by_alias=True)
+    # temp_dict["geoPoint"] = GeoPoint(schedule_data.latitude, schedule_data.longitude)
+    # del temp_dict["latitude"]
+    # del temp_dict["longitude"]
+    # await doc_ref.set(temp_dict)
 
-    await doc_ref.set(schedule_dict)
+    await doc_ref.set(firestore_data)
 
-    # For the response model, we still want to return lat/lon
-    # The Schedule model expects latitude and longitude, not location_geopoint
-    # So, we reconstruct the response data with the original lat/lon and new ID
-    return Schedule(id=doc_ref.id, **schedule_data.model_dump())
+    # Construct the response model. Since Schedule model has populate_by_name=True and aliases,
+    # we can pass the original Pydantic model attributes along with the new ID.
+    # Or, pass the firestore_data and ID, and Pydantic will map using aliases.
+    response_data_dict = firestore_data.copy() # Start with what was saved
+    response_data_dict["id"] = doc_ref.id
+    # Add latitude and longitude back for the response model as it expects them directly
+    response_data_dict["latitude"] = schedule_data.latitude
+    response_data_dict["longitude"] = schedule_data.longitude
+    # Pydantic will use aliases: title -> name, userId -> firebase_userid, content -> description, datetime -> schedule_datetime
+    return Schedule(**response_data_dict)
 
 
 async def get_schedule(
@@ -54,22 +72,22 @@ async def get_schedule(
     if not schedule_db_data:
         return None  # Should not happen if exists is true, but good practice
 
-    # Convert GeoPoint back to latitude and longitude for the Schedule model
-    latitude = schedule_db_data.get("location_geopoint", {}).get("latitude")
-    longitude = schedule_db_data.get("location_geopoint", {}).get("longitude")
-    if latitude is None or longitude is None:
-        # Handle cases where GeoPoint might be missing or malformed if necessary
-        # For now, we assume it's present if the document is valid
-        pass
+    # Add id to the dictionary for Pydantic model creation
+    schedule_db_data["id"] = doc_snapshot.id
 
-    return Schedule(
-        id=doc_snapshot.id,
-        name=schedule_db_data.get("name"),
-        latitude=latitude,
-        longitude=longitude,
-        firebase_userid=schedule_db_data.get("firebase_userid"),
-        description=schedule_db_data.get("description"),
-    )
+    # Extract GeoPoint and convert to latitude/longitude for the Pydantic model
+    # The Pydantic model expects latitude and longitude, not the geoPoint object directly.
+    retrieved_geopoint = schedule_db_data.pop("geoPoint", None) # Use Firestore key "geoPoint"
+    if isinstance(retrieved_geopoint, GeoPoint):
+        schedule_db_data["latitude"] = retrieved_geopoint.latitude
+        schedule_db_data["longitude"] = retrieved_geopoint.longitude
+    else:
+        # Handle missing or malformed geopoint, perhaps set lat/lon to None or raise error
+        schedule_db_data["latitude"] = None
+        schedule_db_data["longitude"] = None
+    
+    # Pydantic will use aliases: title -> name, userId -> firebase_userid, content -> description, datetime -> schedule_datetime
+    return Schedule(**schedule_db_data)
 
 
 async def get_schedules_by_user(
@@ -80,8 +98,9 @@ async def get_schedules_by_user(
     Converts GeoPoint back to latitude/longitude for each schedule.
     """
     schedules_list = []
+    # Query Firestore using the Firestore field name "userId"
     query = db.collection(SCHEDULES_COLLECTION).where(
-        "firebase_userid", "==", firebase_userid
+        filter=FieldFilter("userId", "==", firebase_userid) # Use Firestore key "userId"
     )
     docs_stream = query.stream()
 
@@ -91,19 +110,16 @@ async def get_schedules_by_user(
             if not schedule_db_data:
                 continue
 
-            latitude = schedule_db_data.get("location_geopoint", {}).get("latitude")
-            longitude = schedule_db_data.get("location_geopoint", {}).get("longitude")
+            schedule_db_data["id"] = doc_snapshot.id
+            retrieved_geopoint = schedule_db_data.pop("geoPoint", None) # Firestore key
+            if isinstance(retrieved_geopoint, GeoPoint):
+                schedule_db_data["latitude"] = retrieved_geopoint.latitude
+                schedule_db_data["longitude"] = retrieved_geopoint.longitude
+            else:
+                schedule_db_data["latitude"] = None
+                schedule_db_data["longitude"] = None
 
-            schedules_list.append(
-                Schedule(
-                    id=doc_snapshot.id,
-                    name=schedule_db_data.get("name"),
-                    latitude=latitude,
-                    longitude=longitude,
-                    firebase_userid=schedule_db_data.get("firebase_userid"),
-                    description=schedule_db_data.get("description"),
-                )
-            )
+            schedules_list.append(Schedule(**schedule_db_data))
     return schedules_list
 
 
@@ -121,31 +137,28 @@ async def update_schedule(
     if not doc_snapshot.exists:
         return None
 
-    update_data = schedule_data.model_dump(
-        exclude_unset=True
-    )  # Only include fields that were set
+    # Use model_dump with by_alias=True to get Firestore field names, exclude unset fields
+    update_data = schedule_data.model_dump(by_alias=True, exclude_unset=True)
 
-    # If latitude or longitude is being updated, update/create the GeoPoint
+    # If latitude or longitude is being updated, handle the geoPoint field.
+    # The Pydantic model gives lat/lon, Firestore wants geoPoint.
     if "latitude" in update_data or "longitude" in update_data:
-        # Need existing lat/lon if only one is provided, or use new ones if both provided
-        existing_data = doc_snapshot.to_dict() or {}
-        current_geopoint = existing_data.get("location_geopoint")
+        # Get existing geoPoint to merge if only one coordinate is provided
+        existing_firestore_data = doc_snapshot.to_dict() or {}
+        current_geopoint_obj = existing_firestore_data.get("geoPoint")
 
-        new_latitude = update_data.get(
-            "latitude", current_geopoint.latitude if current_geopoint else None
-        )
-        new_longitude = update_data.get(
-            "longitude", current_geopoint.longitude if current_geopoint else None
-        )
+        new_latitude = update_data.pop("latitude", None) # Remove from update_data
+        new_longitude = update_data.pop("longitude", None) # Remove from update_data
 
-        if new_latitude is not None and new_longitude is not None:
-            update_data["location_geopoint"] = GeoPoint(new_latitude, new_longitude)
+        final_latitude = new_latitude if new_latitude is not None else (current_geopoint_obj.latitude if isinstance(current_geopoint_obj, GeoPoint) else None)
+        final_longitude = new_longitude if new_longitude is not None else (current_geopoint_obj.longitude if isinstance(current_geopoint_obj, GeoPoint) else None)
 
-        # Remove individual latitude and longitude from update_data if they were used to make GeoPoint
-        if "latitude" in update_data:
-            del update_data["latitude"]
-        if "longitude" in update_data:
-            del update_data["longitude"]
+        if final_latitude is not None and final_longitude is not None:
+            update_data["geoPoint"] = GeoPoint(final_latitude, final_longitude)
+        elif new_latitude is not None or new_longitude is not None:
+            # One coord provided but not the other, and no existing to merge from: Error or specific logic needed.
+            # For now, if we can't form a full GeoPoint, we don't update it.
+            pass 
 
     if not update_data:  # No actual data to update
         return await get_schedule(db, schedule_id)  # Return current state

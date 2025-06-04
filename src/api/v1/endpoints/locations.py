@@ -10,12 +10,15 @@ from firebase_admin import (
     # messaging, # Removed as it's now in notification_service
 )
 from firebase_admin.exceptions import FirebaseError
+from google.cloud.firestore_v1 import FieldFilter
 
 # Geopy for distance calculation
 from geopy.distance import geodesic
 
 # Import from the new notification service
 from src.services.notification_service import send_fcm_proximity_notification
+
+from src.crud import crud_schedule # Import the crud_schedule module
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -51,43 +54,41 @@ async def handle_location_update_and_proximity_check(location_data: LocationCrea
     # e.g., await crud.store_location(db, location_data)
 
     try:
-        schedules_ref = db.collection("schedule")
-        # Use await for stream() and iterate with async for
-        user_schedules_stream = schedules_ref.where(
-            "firebase_userid", "==", location_data.firebase_userid
-        ).stream()  # .stream() itself returns an async iterator
+        # Fetch schedules using the CRUD function
+        user_schedules = await crud_schedule.get_schedules_by_user(
+            db=db, firebase_userid=location_data.firebase_userid
+        )
 
         current_device_location = (location_data.latitude, location_data.longitude)
 
-        async for schedule_doc in user_schedules_stream:  # Iterate with async for
-            schedule_data = schedule_doc.to_dict()
-            if not schedule_data:
-                continue
-            logger.info(f"Schedule data: {schedule_data}")
-            location_geopoint = schedule_data.get("geoPoint")
-            logger.info(f"Location geopoint: {location_geopoint}")
-            if isinstance(location_geopoint, firestore.GeoPoint):
+        for schedule_item in user_schedules: # Iterate over Schedule model instances
+            # schedule_item is now a Schedule Pydantic model instance
+            # which has latitude and longitude attributes directly
+            
+            # Ensure schedule_item has latitude and longitude
+            if schedule_item.latitude is not None and schedule_item.longitude is not None:
                 schedule_location = (
-                    location_geopoint.latitude,
-                    location_geopoint.longitude,
+                    schedule_item.latitude,
+                    schedule_item.longitude,
                 )
                 distance_meters = geodesic(
                     current_device_location, schedule_location
                 ).meters
-                logger.info(f"Distance meters: {distance_meters}")
-                if distance_meters <= 100:
+                logger.info(f"Comparing with schedule '{schedule_item.name}' (ID: {schedule_item.id}) at ({schedule_item.latitude}, {schedule_item.longitude}). Distance: {distance_meters:.2f}m")
+
+                if distance_meters <= 100: # Using 100 meters as proximity threshold
                     found_proximate_schedule = True
                     logger.info(
-                        f"User {location_data.firebase_userid} is within 100m of schedule {schedule_doc.id} (distance: {distance_meters:.2f}m)"
+                        f"User {location_data.firebase_userid} is within 100m of schedule '{schedule_item.name}' (ID: {schedule_item.id}) (distance: {distance_meters:.2f}m)"
                     )
                     break  # Found one, no need to check further
             else:
                 logger.warning(
-                    f"Schedule {schedule_doc.id} for user {location_data.firebase_userid} has missing or invalid location_geopoint."
+                    f"Schedule {schedule_item.id} for user {location_data.firebase_userid} has missing latitude or longitude."
                 )
 
         if found_proximate_schedule:
-            fcm_token_doc_ref = db.collection("fcm_tokens").document(
+            fcm_token_doc_ref = db.collection("fcm_token").document(
                 location_data.firebase_userid
             )
             fcm_token_doc = await fcm_token_doc_ref.get()  # Add await here
