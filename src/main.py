@@ -59,7 +59,7 @@ app = FastAPI(
 )
 
 # Include the API routers
-app.include_router(locations.router, prefix="/api/v1/locations", tags=["locations"])
+app.include_router(locations.router, prefix="/api/v1", tags=["locations"])
 app.include_router(
     schedules.router, prefix="/api/v1/schedules", tags=["schedules"]
 )  # Add the schedules router
