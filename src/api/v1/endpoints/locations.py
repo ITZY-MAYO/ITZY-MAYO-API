@@ -63,8 +63,9 @@ async def handle_location_update_and_proximity_check(location_data: LocationCrea
             schedule_data = schedule_doc.to_dict()
             if not schedule_data:
                 continue
-
+            logger.info(f"Schedule data: {schedule_data}")
             location_geopoint = schedule_data.get("geoPoint")
+            logger.info(f"Location geopoint: {location_geopoint}")
             if isinstance(location_geopoint, firestore.GeoPoint):
                 schedule_location = (
                     location_geopoint.latitude,
@@ -73,7 +74,7 @@ async def handle_location_update_and_proximity_check(location_data: LocationCrea
                 distance_meters = geodesic(
                     current_device_location, schedule_location
                 ).meters
-
+                logger.info(f"Distance meters: {distance_meters}")
                 if distance_meters <= 100:
                     found_proximate_schedule = True
                     logger.info(
