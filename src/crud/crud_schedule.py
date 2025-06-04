@@ -1,5 +1,5 @@
 from firebase_admin import firestore
-from google.cloud.firestore_v1.types import GeoPoint  # For creating GeoPoint instances
+from google.cloud.firestore_v1 import GeoPoint  # For creating GeoPoint instances
 from typing import (
     List,
     Optional,
